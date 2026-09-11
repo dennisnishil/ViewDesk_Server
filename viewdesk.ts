@@ -1,4 +1,4 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import http from "http";
 import { Server as SocketServer, Socket } from "socket.io";
 import { mouse, keyboard, Button, Key } from "@nut-tree-fork/nut-js";
@@ -8,7 +8,7 @@ import path from "path";
 import os from "os";
 
 // ==========================================
-// 1. UAC / DOMAIN ADMIN ELEVATION CHECK
+// 1. UAC / ADMINISTRATIVE ELEVATION CHECK
 // ==========================================
 function ensureAdminPrivileges(): void {
   if (process.platform === "win32") {
@@ -16,7 +16,9 @@ function ensureAdminPrivileges(): void {
       execSync("net session", { stdio: "ignore" });
       console.log("[ViewDesk Security] Running with FULL Administrative Privileges.");
     } catch {
-      console.warn("[ViewDesk Warning] Running without elevated privileges. Some administrative OS functions may be restricted.");
+      console.warn(
+        "[ViewDesk Warning] Running without elevated privileges. Some OS administrative functions may be restricted."
+      );
     }
   }
 }
@@ -24,17 +26,18 @@ function ensureAdminPrivileges(): void {
 ensureAdminPrivileges();
 
 // ==========================================
-// 2. HARDWARE-BOUND ID & 7-CHAR PASSWORD GENERATOR
+// 2. HARDWARE UNIQUE ID & SHUFFLED PASSWORD
 // ==========================================
 function getHardwareUniqueId(): string {
   try {
     const interfaces = os.networkInterfaces();
     let macAddress = "";
 
+    // Grab primary physical MAC address
     for (const name of Object.keys(interfaces)) {
-      const networkInterface = interfaces[name];
-      if (networkInterface) {
-        for (const net of networkInterface) {
+      const netInterface = interfaces[name];
+      if (netInterface) {
+        for (const net of netInterface) {
           if (!net.internal && net.mac && net.mac !== "00:00:00:00:00:00") {
             macAddress = net.mac;
             break;
@@ -44,36 +47,38 @@ function getHardwareUniqueId(): string {
       if (macAddress) break;
     }
 
-    if (!macAddress) macAddress = os.hostname();
-
+    // Combine MAC + Hostname to guarantee non-duplicate ID across different machines
+    const seed = `${macAddress || os.hostname()}-${os.hostname()}`;
     let hash = 0;
-    for (let i = 0; i < macAddress.length; i++) {
-      hash = (hash << 5) - hash + macAddress.charCodeAt(i);
+    for (let i = 0; i < seed.length; i++) {
+      hash = (hash << 5) - hash + seed.charCodeAt(i);
       hash |= 0;
     }
-    
-    const absHash = Math.abs(hash).toString().padStart(9, "7");
+
+    const absHash = Math.abs(hash).toString().padStart(9, "0");
     return `${absHash.substring(0, 3)}-${absHash.substring(3, 6)}-${absHash.substring(6, 9)}`;
   } catch {
-    return "123-456-789";
+    // Fallback pseudo-random ID if OS calls fail
+    const rand = Math.floor(100000000 + Math.random() * 900000000).toString();
+    return `${rand.substring(0, 3)}-${rand.substring(3, 6)}-${rand.substring(6, 9)}`;
   }
 }
 
-// Generate dynamic 7-character password mixing A-Z, a-z, 0-9
 function generateSessionPassword(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let password = "";
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 6; i++) {
     password += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return password;
 }
 
+// Generated freshly on every app launch
 const PC_VIEWDESK_ID = getHardwareUniqueId();
 const PC_SESSION_PASSWORD = generateSessionPassword();
 
 // ==========================================
-// 3. CONFIGURATION & TYPES
+// 3. TYPES & PERMISSION CONFIGURATION
 // ==========================================
 const PORT = process.env.PORT || 3000;
 const DEVELOPER_NAME = "nishildennis";
@@ -94,16 +99,31 @@ interface FileOperation {
   fileBufferBase64?: string;
 }
 
-const activeClientsByViewdeskId = new Map<string, string>(); 
-const viewdeskIdsBySocketId = new Map<string, string>();     
-const passwordsByViewdeskId = new Map<string, string>(); 
+// Global real-time permission controls
+const PERMISSIONS = {
+  allowControl: true, // Allow Remote Keyboard & Mouse input execution
+  allowFiles: true,   // Allow Remote File System operations
+};
+
+let customUnattendedPassword = "";
+
+// Device and Session Maps
+const activeClientsByViewdeskId = new Map<string, string>();
+const viewdeskIdsBySocketId = new Map<string, string>();
+const passwordsByViewdeskId = new Map<string, string>();
+const customPasswordsByViewdeskId = new Map<string, string>();
 const activeSessions = new Map<string, { hostViewdeskId: string; guestViewdeskId: string }>();
 
 // ==========================================
-// 4. NATIVE INPUT & FILE SYSTEM ENGINE
+// 4. NATIVE DEVICE CONTROLLER (NUT-JS & FILESYSTEM)
 // ==========================================
 class DeviceController {
   public static async executeInput(event: InputEvent): Promise<void> {
+    if (!PERMISSIONS.allowControl) {
+      console.warn("[ViewDesk Access] Remote input blocked by local permission settings.");
+      return;
+    }
+
     try {
       switch (event.type) {
         case "mousemove":
@@ -142,19 +162,27 @@ class DeviceController {
   }
 
   public static handleFileOperation(op: FileOperation): any {
+    if (!PERMISSIONS.allowFiles) {
+      return { success: false, error: "Remote file operations disabled by host system." };
+    }
+
     try {
       if (op.action === "list" && op.dirPath) {
         return { success: true, files: fs.readdirSync(op.dirPath) };
       }
       if (op.action === "delete" && op.filePath) {
-        fs.unlinkSync(op.filePath);
-        return { success: true, message: `File ${op.filePath} deleted successfully.` };
+        if (fs.existsSync(op.filePath)) {
+          fs.unlinkSync(op.filePath);
+          return { success: true, message: `File ${op.filePath} deleted successfully.` };
+        }
+        return { success: false, error: "File not found." };
       }
       if (op.action === "upload" && op.dirPath && op.fileName && op.fileBufferBase64) {
         const fullPath = path.join(op.dirPath, op.fileName);
         fs.writeFileSync(fullPath, Buffer.from(op.fileBufferBase64, "base64"));
         return { success: true, message: `File uploaded to ${fullPath}` };
       }
+      return { success: false, error: "Invalid operation parameters." };
     } catch (err: any) {
       return { success: false, error: err.message };
     }
@@ -172,84 +200,51 @@ class DeviceController {
 }
 
 // ==========================================
-// 5. EXPRESS APP & LAYOUT WITH TOP DASHBOARD
+// 5. EXPRESS & SOCKET.IO SETUP
 // ==========================================
 const app = express();
 const server = http.createServer(app);
 const io = new SocketServer(server, { cors: { origin: "*" } });
 
-app.get("/", (_req, res) => {
+app.get("/", (_req: Request, res: Response) => {
   res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ViewDesk - Your Window to Remote Productivity</title>
+  <title>ViewDesk - Remote Support</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 0; }
-    
     .header { background: #1e293b; padding: 18px 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #ef4444; }
     .brand { font-size: 1.5rem; font-weight: bold; color: #ffffff; display: flex; align-items: center; gap: 12px; }
     .brand-accent { color: #ef4444; }
-    .logo-icon { width: 32px; height: 32px; fill: none; stroke: #ef4444; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    .admin-badge { background: #10b981; color: #000; font-size: 0.75rem; font-weight: bold; padding: 4px 8px; border-radius: 4px; text-transform: uppercase; }
-
     .main-container { max-width: 1100px; margin: 25px auto; padding: 0 20px; }
-
-    .dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 30px; }
-    .card { background: #1e293b; border-radius: 12px; padding: 28px; border: 1px solid #334155; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
-    .card h2 { margin-top: 0; font-size: 1.1rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
-
+    .dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 25px; }
+    .card { background: #1e293b; border-radius: 12px; padding: 28px; border: 1px solid #334155; }
+    .card h2 { margin-top: 0; font-size: 1.1rem; color: #94a3b8; text-transform: uppercase; }
     .id-display { background: #0f172a; padding: 16px; border-radius: 8px; border: 1px solid #334155; text-align: center; margin: 15px 0 10px 0; }
     .id-number { font-size: 2.2rem; font-weight: bold; letter-spacing: 3px; color: #10b981; font-family: monospace; }
-    
-    .password-box { background: #0f172a; padding: 10px 15px; border-radius: 6px; border: 1px dashed #ef4444; display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-    .password-title { font-size: 0.85rem; color: #94a3b8; text-transform: uppercase; }
+    .password-box { background: #0f172a; padding: 10px 15px; border-radius: 6px; border: 1px dashed #ef4444; display: flex; justify-content: space-between; align-items: center; }
+    .password-title { font-size: 0.85rem; color: #94a3b8; }
     .password-val { font-size: 1.4rem; font-weight: bold; color: #ef4444; font-family: monospace; letter-spacing: 2px; }
-
-    input[type="text"], input[type="password"] { width: 100%; padding: 14px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; font-size: 1.2rem; text-align: center; font-family: monospace; letter-spacing: 2px; margin: 12px 0; outline: none; }
-    input:focus { border-color: #ef4444; }
-
-    button { width: 100%; padding: 14px; border-radius: 8px; border: none; font-size: 1rem; font-weight: bold; cursor: pointer; transition: background 0.2s; background: #ef4444; color: #fff; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 14px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; font-size: 1.2rem; text-align: center; font-family: monospace; margin: 12px 0; outline: none; }
+    button { width: 100%; padding: 14px; border-radius: 8px; border: none; font-size: 1rem; font-weight: bold; cursor: pointer; background: #ef4444; color: #fff; }
     button:hover { background: #dc2626; }
-
-    .welcome-card { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-radius: 12px; padding: 30px; border: 1px solid #334155; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
-    .slogan { font-size: 1.3rem; font-weight: 600; color: #ef4444; margin: 8px 0 16px 0; font-style: italic; }
-    .welcome-text { font-size: 0.98rem; color: #94a3b8; line-height: 1.6; max-width: 900px; margin: 0 auto; }
-
-    .features-title { font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px; color: #f8fafc; margin-top: 25px; margin-bottom: 15px; font-weight: bold; }
-    .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; text-align: left; margin-top: 15px; }
-    .feature-item { background: #0f172a; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; font-size: 0.9rem; color: #cbd5e1; display: flex; align-items: center; gap: 10px; }
-    .feature-item::before { content: "✓"; color: #10b981; font-weight: bold; }
-
     .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.85); z-index: 1000; justify-content: center; align-items: center; }
     .modal-card { background: #1e293b; width: 420px; padding: 30px; border-radius: 12px; text-align: center; border: 2px solid #ef4444; }
-
     #viewer-container { display: none; width: 100vw; height: 100vh; background: #000; position: fixed; top: 0; left: 0; z-index: 999; }
     #admin-toolbar { position: absolute; top: 15px; left: 50%; transform: translateX(-50%); z-index: 1002; background: #1e293b; padding: 10px 20px; border-radius: 8px; display: flex; gap: 10px; border: 1px solid #ef4444; }
-    #admin-toolbar button { width: auto; padding: 8px 15px; font-size: 0.85rem; background: #334155; }
+    #admin-toolbar button { width: auto; padding: 8px 15px; font-size: 0.85rem; background: #334155; color: white; }
     #admin-toolbar button:hover { background: #ef4444; }
     #remote-video { width: 100%; height: 100%; object-fit: contain; outline: none; }
-
-    .footer { text-align: center; margin-top: 50px; padding: 20px; color: #64748b; font-size: 0.85rem; border-top: 1px solid #1e293b; }
   </style>
 </head>
 <body>
 
   <div class="header">
-    <div class="brand">
-      <svg class="logo-icon" viewBox="0 0 24 24">
-        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-        <line x1="8" y1="21" x2="16" y2="21"></line>
-        <line x1="12" y1="17" x2="12" y2="21"></line>
-        <polyline points="7 10 10 7 13 10"></polyline>
-        <line x1="10" y1="7" x2="10" y2="14"></line>
-      </svg>
-      <div><span class="brand-accent">View</span>Desk</div>
-      <span class="admin-badge">Secure Access</span>
-    </div>
+    <div class="brand"><div><span class="brand-accent">View</span>Desk</div></div>
     <div style="color: #10b981; font-size: 0.9rem;">● Cloud Signaling Active</div>
   </div>
 
@@ -257,7 +252,7 @@ app.get("/", (_req, res) => {
     <div class="dashboard">
       <div class="card">
         <h2>This Desk</h2>
-        <p style="color: #94a3b8; font-size: 0.85rem; margin-bottom: 0;">Share this ID & Password to grant remote access.</p>
+        <p style="color: #94a3b8; font-size: 0.85rem;">Share this ID & Password to grant remote access.</p>
         
         <div class="id-display"><div id="my-viewdesk-id" class="id-number">${PC_VIEWDESK_ID}</div></div>
         
@@ -265,8 +260,6 @@ app.get("/", (_req, res) => {
           <span class="password-title">One-Time Password:</span>
           <span class="password-val" id="my-password">${PC_SESSION_PASSWORD}</span>
         </div>
-
-        <p style="font-size: 0.75rem; color: #64748b; text-align: center; margin-top: 5px;">Password resets on app restart</p>
       </div>
 
       <div class="card">
@@ -276,33 +269,13 @@ app.get("/", (_req, res) => {
         <button onclick="openPasswordPrompt()">Full Access Connect</button>
       </div>
     </div>
-
-    <div class="welcome-card">
-      <h1 style="margin: 0; font-size: 1.8rem; color: #ffffff;">Welcome to ViewDesk</h1>
-      <div class="slogan">"ViewDesk - Your Window to Remote Productivity."</div>
-      <p class="welcome-text">
-        In today's connected world, accessing your devices remotely is essential. ViewDesk enables secure desktop screen access and control from anywhere, helping individuals and businesses stay productive.
-      </p>
-
-      <div class="features-title">Key Features</div>
-      <div class="features-grid">
-        <div class="feature-item">Secure Remote Desktop Access</div>
-        <div class="feature-item">Real-Time Screen Viewing</div>
-        <div class="feature-item">Fast and Stable Connections</div>
-        <div class="feature-item">Multi-Device Support</div>
-        <div class="feature-item">Remote Technical Assistance</div>
-        <div class="feature-item">Enterprise-Grade Security</div>
-        <div class="feature-item">Easy Device Management</div>
-        <div class="feature-item">Seamless Team Collaboration</div>
-      </div>
-    </div>
   </div>
 
   <div class="modal-overlay" id="password-modal">
     <div class="modal-card">
-      <h2 style="margin-top:0;">Authentication Required</h2>
-      <p style="color: #94a3b8; font-size: 0.9rem;">Enter the 7-character password shown on the target desk:</p>
-      <input type="password" id="input-password" placeholder="*******" maxlength="7" />
+      <h2>Authentication Required</h2>
+      <p style="color: #94a3b8;">Enter 6-character session password:</p>
+      <input type="password" id="input-password" placeholder="******" maxlength="6" />
       <div style="display: flex; gap: 10px; margin-top: 15px;">
         <button style="background: #10b981;" onclick="submitPasswordConnect()">Connect</button>
         <button style="background: #f43f5e;" onclick="closePasswordModal()">Cancel</button>
@@ -318,23 +291,11 @@ app.get("/", (_req, res) => {
     <video id="remote-video" autoplay playsinline tabindex="0"></video>
   </div>
 
-  <div class="footer">
-    ViewDesk Remote Access &bull; Developed by <strong>${DEVELOPER_NAME}</strong>
-  </div>
-
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    // LIVE RENDER SIGNALING ENDPOINT
-    const CLOUD_URL = "https://viewdesk-server.onrender.com"; 
-    const SOCKET_URL = window.location.hostname === "localhost" ? "http://localhost:3000" : CLOUD_URL;
-
-    const socket = io(SOCKET_URL, {
-      transports: ["websocket", "polling"],
-      secure: true
-    });
-
-    const myViewDeskId = "${PC_VIEWDESK_ID}";
-    const myPassword = "${PC_SESSION_PASSWORD}";
+    const socket = io();
+    let myViewDeskId = "${PC_VIEWDESK_ID}";
+    let myPassword = "${PC_SESSION_PASSWORD}";
     let pc = null;
     let localStream = null;
     let currentRequesterId = null;
@@ -347,14 +308,24 @@ app.get("/", (_req, res) => {
     };
 
     socket.on('connect', () => {
-      socket.emit('register_device', { viewdeskId: myViewDeskId, password: myPassword });
+      socket.emit('register_device', { viewdeskId: myViewDeskId, password: myPassword, customPassword: "" });
+    });
+
+    socket.on('init_credentials', (data) => {
+      if (data.viewdeskId) {
+        myViewDeskId = data.viewdeskId;
+        document.getElementById('my-viewdesk-id').innerText = data.viewdeskId;
+      }
+      if (data.password) {
+        myPassword = data.password;
+        document.getElementById('my-password').innerText = data.password;
+      }
     });
 
     function openPasswordPrompt() {
       const targetId = document.getElementById('target-id').value.trim();
       if (!targetId) return alert("Please enter a target ViewDesk ID");
       if (targetId === myViewDeskId) return alert("Cannot connect to self ID");
-
       document.getElementById('password-modal').style.display = 'flex';
     }
 
@@ -366,9 +337,7 @@ app.get("/", (_req, res) => {
     function submitPasswordConnect() {
       const targetId = document.getElementById('target-id').value.trim();
       const enteredPassword = document.getElementById('input-password').value.trim();
-
       if (!enteredPassword) return alert("Please enter the password");
-
       closePasswordModal();
       socket.emit('request_session_auth', { targetViewdeskId: targetId, password: enteredPassword });
     }
@@ -481,33 +450,59 @@ app.get("/", (_req, res) => {
 });
 
 // ==========================================
-// 6. SIGNALING SERVER & AUTH ROUTING
+// 6. SIGNALING SERVER & SOCKET.IO EVENTS
 // ==========================================
 io.on("connection", (socket: Socket) => {
-  socket.on("register_device", ({ viewdeskId, password }: { viewdeskId: string; password: string }) => {
-    activeClientsByViewdeskId.set(viewdeskId, socket.id);
-    viewdeskIdsBySocketId.set(socket.id, viewdeskId);
-    passwordsByViewdeskId.set(viewdeskId, password);
-    console.log(`[ViewDesk Registered] ID: ${viewdeskId} | Password: ${password}`);
-  });
+  // Send generated credentials to the web client view immediately
+  socket.emit("init_credentials", { viewdeskId: PC_VIEWDESK_ID, password: PC_SESSION_PASSWORD });
 
-  socket.on("request_session_auth", ({ targetViewdeskId, password }: { targetViewdeskId: string; password: string }) => {
-    const hostSocketId = activeClientsByViewdeskId.get(targetViewdeskId);
-    const correctPassword = passwordsByViewdeskId.get(targetViewdeskId);
-    const requesterViewdeskId = viewdeskIdsBySocketId.get(socket.id);
-
-    if (!hostSocketId || !requesterViewdeskId) {
-      return socket.emit("auth_failed", { message: "Target ViewDesk ID is offline or invalid." });
+  socket.on(
+    "register_device",
+    ({
+      viewdeskId,
+      password,
+      customPassword,
+    }: {
+      viewdeskId: string;
+      password: string;
+      customPassword?: string;
+    }) => {
+      activeClientsByViewdeskId.set(viewdeskId, socket.id);
+      viewdeskIdsBySocketId.set(socket.id, viewdeskId);
+      passwordsByViewdeskId.set(viewdeskId, password);
+      if (customPassword) customPasswordsByViewdeskId.set(viewdeskId, customPassword);
+      console.log(`[ViewDesk Registered] ID: ${viewdeskId} | One-Time Pwd: ${password}`);
     }
+  );
 
-    if (correctPassword && password === correctPassword) {
-      activeSessions.set(socket.id, { hostViewdeskId: targetViewdeskId, guestViewdeskId: requesterViewdeskId });
-      socket.emit("auth_success", { hostViewdeskId: targetViewdeskId });
-      io.to(hostSocketId).emit("incoming_authenticated_session", { requesterViewdeskId });
-    } else {
-      socket.emit("auth_failed", { message: "Incorrect session password." });
+  socket.on(
+    "request_session_auth",
+    ({ targetViewdeskId, password }: { targetViewdeskId: string; password: string }) => {
+      const hostSocketId = activeClientsByViewdeskId.get(targetViewdeskId);
+      const correctPassword = passwordsByViewdeskId.get(targetViewdeskId);
+      const customPassword = customPasswordsByViewdeskId.get(targetViewdeskId);
+      const requesterViewdeskId = viewdeskIdsBySocketId.get(socket.id);
+
+      if (!hostSocketId || !requesterViewdeskId) {
+        return socket.emit("auth_failed", { message: "Target ViewDesk ID is offline or invalid." });
+      }
+
+      const isValidPassword =
+        (correctPassword && password === correctPassword) ||
+        (customPassword && password === customPassword);
+
+      if (isValidPassword) {
+        activeSessions.set(socket.id, {
+          hostViewdeskId: targetViewdeskId,
+          guestViewdeskId: requesterViewdeskId,
+        });
+        socket.emit("auth_success", { hostViewdeskId: targetViewdeskId });
+        io.to(hostSocketId).emit("incoming_authenticated_session", { requesterViewdeskId });
+      } else {
+        socket.emit("auth_failed", { message: "Incorrect password." });
+      }
     }
-  });
+  );
 
   socket.on("webrtc_signal", ({ targetViewdeskId, signal }: { targetViewdeskId: string; signal: any }) => {
     const targetSocketId = activeClientsByViewdeskId.get(targetViewdeskId);
@@ -517,12 +512,15 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  socket.on("input_event", async ({ hostViewdeskId, event }: { hostViewdeskId: string; event: InputEvent }) => {
-    const session = activeSessions.get(socket.id);
-    if (session && session.hostViewdeskId === hostViewdeskId) {
-      await DeviceController.executeInput(event);
+  socket.on(
+    "input_event",
+    async ({ hostViewdeskId, event }: { hostViewdeskId: string; event: InputEvent }) => {
+      const session = activeSessions.get(socket.id);
+      if (session && session.hostViewdeskId === hostViewdeskId) {
+        await DeviceController.executeInput(event);
+      }
     }
-  });
+  );
 
   socket.on("file_operation", ({ hostViewdeskId, op }: { hostViewdeskId: string; op: FileOperation }) => {
     const hostSocketId = activeClientsByViewdeskId.get(hostViewdeskId);
@@ -538,6 +536,7 @@ io.on("connection", (socket: Socket) => {
       activeClientsByViewdeskId.delete(viewdeskId);
       viewdeskIdsBySocketId.delete(socket.id);
       passwordsByViewdeskId.delete(viewdeskId);
+      customPasswordsByViewdeskId.delete(viewdeskId);
       activeSessions.delete(socket.id);
       console.log(`[ViewDesk Disconnected] ID: ${viewdeskId}`);
     }
@@ -545,17 +544,18 @@ io.on("connection", (socket: Socket) => {
 });
 
 // ==========================================
-// 7. START SERVER ENGINE
+// 7. START ENGINE
 // ==========================================
 function startServer(port: number) {
-  server.listen(port)
+  server
+    .listen(port)
     .on("listening", () => {
       console.log(`
 ==================================================
   ViewDesk Engine (${DEVELOPER_NAME})
-  PC Hardware ID: ${PC_VIEWDESK_ID}
-  Session Password: ${PC_SESSION_PASSWORD}
-  Listening on Port: ${port}
+  PC Hardware ID   : ${PC_VIEWDESK_ID}
+  Session Password : ${PC_SESSION_PASSWORD}
+  Listening Port   : ${port}
 ==================================================
       `);
     })
