@@ -5,12 +5,11 @@
   "main": "dist/viewdesk.js",
   "type": "commonjs",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/viewdesk.js",
-    "dev": "npx tsx viewdesk.ts",
-    "electron:start": "electron .",
-    "build:exe": "electron-builder --win"
-  },
+  "build": "tsc",
+  "postinstall": "npm run build",
+  "start": "node dist/viewdesk.js",
+  "dev": "npx tsx viewdesk.ts"
+},
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.1.2",
     "express": "^4.19.2",
