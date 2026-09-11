@@ -1,14 +1,15 @@
 {
   "name": "viewdesk-remote-support",
   "version": "1.0.0",
-  "description": "ViewDesk Consent-Based Remote Support Engine",
-  "main": "dist/viewdesk.js",
+  "description": "ViewDesk Remote Desktop Support Application",
+  "main": "main.js",
   "type": "commonjs",
   "scripts": {
-  "build": "tsc",
-  "postinstall": "npm run build",
+  "build": "npx tsc",
   "start": "node dist/viewdesk.js",
-  "dev": "npx tsx viewdesk.ts"
+  "dev": "npx tsx viewdesk.ts",
+  "electron:start": "electron .",
+  "build:exe": "npm run build && electron-builder --win"
 },
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.1.2",
@@ -23,14 +24,12 @@
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "build": {
     "appId": "com.viewdesk.remotesupport",
     "productName": "ViewDesk",
     "files": [
       "dist/**/*",
+      "main.js",
       "package.json"
     ],
     "asar": false,
@@ -42,8 +41,7 @@
         "nsis",
         "portable"
       ],
-      "requestedExecutionLevel": "requireAdministrator",
-      "forceCodeSigning": false
+      "requestedExecutionLevel": "requireAdministrator"
     },
     "nsis": {
       "oneClick": false,
